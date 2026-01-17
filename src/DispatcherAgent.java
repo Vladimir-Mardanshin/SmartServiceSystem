@@ -15,23 +15,28 @@ public class DispatcherAgent extends Agent {
     private final Logger log = Logger.getMyLogger(getClass().getName());
 
     private final List<AID> technicians = new ArrayList<>();
-    private final Map<String, Boolean> busyByTech = new HashMap<>();
+    private int rr = 0;
 
     private final Deque<Ticket> queue = new ArrayDeque<>();
+    private final Map<String, Ticket> pendingByConv = new HashMap<>();
     private final Map<String, Ticket> inFlightByConv = new HashMap<>();
+    private final Map<String, Long> cooldownUntilByTech = new HashMap<>();
 
-    private int rr = 0;
     private long lastQueueLogAt = 0L;
+
+    private final int tickMs = 600;
+    private final long optimisticCooldownMs = 300;
+    private final long refuseCooldownMs = 1200;
 
     @Override
     protected void setup() {
         registerAsDispatcher();
 
-        addBehaviour(new TickerBehaviour(this, 700) {
+        addBehaviour(new TickerBehaviour(this, tickMs) {
             @Override
             protected void onTick() {
                 refreshTechnicians();
-                tryDispatch();
+                tryDispatchOnce();
             }
         });
 
@@ -76,20 +81,20 @@ public class DispatcherAgent extends Agent {
 
         Ticket t = new Ticket(UUID.randomUUID().toString(), msg.getSender(), issue);
         queue.addLast(t);
-        logQueue("принята заявка " + t.ticketId);
 
         ACLMessage ack = msg.createReply();
         ack.setPerformative(ACLMessage.AGREE);
         ack.setLanguage(ServiceOntology.LANG);
         ack.setProtocol(ServiceOntology.PROTOCOL_RESULT);
-        ack.setContent("Заявка принята, id=" + t.ticketId);
+        ack.setContent("Заявка принята, id=" + t.ticketId + " (диспетчер=" + getLocalName() + ")");
         send(ack);
 
+        logQueue("принята заявка " + t.ticketId);
         log.info(getLocalName() + ": принята заявка " + t.ticketId +
                 " от " + msg.getSender().getLocalName() +
                 " (проблема: " + issue + ")");
 
-        tryDispatch();
+        tryDispatchOnce();
     }
 
     private void onTechnicianReply(ACLMessage msg) {
@@ -97,30 +102,38 @@ public class DispatcherAgent extends Agent {
         if (conv == null) return;
 
         Ticket t = inFlightByConv.get(conv);
+        if (t == null) t = pendingByConv.get(conv);
         if (t == null) return;
 
-        String techName = msg.getSender().getName();
+        String techKey = msg.getSender().getName();
+        int perf = msg.getPerformative();
 
-        if (msg.getPerformative() == ACLMessage.REFUSE) {
-            busyByTech.put(techName, true);
-
-            log.info(getLocalName() + ": мастер " + msg.getSender().getLocalName() +
-                    " отказался (занят), заявка " + t.ticketId + " будет переназначена");
-
-            t.tried.add(techName);
-            inFlightByConv.remove(conv);
-            queue.addFirst(t);
-
-            logQueue("переназначение " + t.ticketId + " (отказ " + msg.getSender().getLocalName() + ")");
-            tryDispatch();
+        if (perf == ACLMessage.AGREE) {
+            Ticket fromPending = pendingByConv.remove(conv);
+            if (fromPending == null) return;
+            inFlightByConv.put(conv, fromPending);
+            logQueue("мастер принял " + fromPending.ticketId + " (" + msg.getSender().getLocalName() + ")");
             return;
         }
 
-        if (msg.getPerformative() == ACLMessage.INFORM) {
-            busyByTech.put(techName, false);
-
+        if (perf == ACLMessage.REFUSE) {
+            pendingByConv.remove(conv);
             inFlightByConv.remove(conv);
-            logQueue("выполнено " + t.ticketId + " (" + msg.getSender().getLocalName() + ")");
+
+            cooldownUntilByTech.put(techKey, System.currentTimeMillis() + refuseCooldownMs);
+
+            t.tried.add(techKey);
+            queue.addLast(t);
+
+            log.info(getLocalName() + ": мастер " + msg.getSender().getLocalName() +
+                    " отказался (занят), заявка " + t.ticketId + " -> обратно в очередь");
+            logQueue("REFUSE " + t.ticketId + " (" + msg.getSender().getLocalName() + ")");
+            return;
+        }
+
+        if (perf == ACLMessage.INFORM) {
+            pendingByConv.remove(conv);
+            inFlightByConv.remove(conv);
 
             ACLMessage toClient = new ACLMessage(ACLMessage.CONFIRM);
             toClient.addReceiver(t.client);
@@ -130,99 +143,86 @@ public class DispatcherAgent extends Agent {
             toClient.setContent(
                     "Заявка выполнена\n" +
                             "ID: " + t.ticketId + "\n" +
+                            "Диспетчер: " + getLocalName() + "\n" +
                             "Мастер: " + msg.getSender().getLocalName() + "\n" +
                             "Результат: " + msg.getContent()
             );
             send(toClient);
 
-            log.info(getLocalName() + ": заявка " + t.ticketId +
-                    " успешно выполнена мастером " + msg.getSender().getLocalName());
-
-            tryDispatch();
+            logQueue("выполнено " + t.ticketId + " (" + msg.getSender().getLocalName() + ")");
             return;
         }
 
-        if (msg.getPerformative() == ACLMessage.FAILURE) {
-            busyByTech.put(techName, false);
-
-            log.info(getLocalName() + ": мастер " + msg.getSender().getLocalName() +
-                    " сообщил об ошибке при обработке заявки " + t.ticketId);
-
-            t.tried.add(techName);
+        if (perf == ACLMessage.FAILURE) {
+            pendingByConv.remove(conv);
             inFlightByConv.remove(conv);
-            queue.addFirst(t);
 
-            logQueue("повтор " + t.ticketId + " (ошибка " + msg.getSender().getLocalName() + ")");
-            tryDispatch();
+            cooldownUntilByTech.put(techKey, System.currentTimeMillis() + refuseCooldownMs);
+
+            t.tried.add(techKey);
+            queue.addLast(t);
+
+            logQueue("FAILURE " + t.ticketId + " (" + msg.getSender().getLocalName() + ")");
         }
     }
 
-    private void tryDispatch() {
+    private void tryDispatchOnce() {
         if (queue.isEmpty()) return;
+        if (technicians.isEmpty()) return;
 
-        while (!queue.isEmpty()) {
-            Ticket t = queue.peekFirst();
+        Ticket t = queue.peekFirst();
 
-            if (technicians.isEmpty()) {
-                logQueue("нет мастеров в DF, заявка " + t.ticketId + " ждёт");
-                log.info(getLocalName() + ": мастера ещё не найдены в DF, заявка " + t.ticketId + " ожидает");
-                doWait(250);
-                break;
-            }
-
-            AID tech = pickFreeTechnician(t);
-
-            if (tech == null) {
-                queue.removeFirst();
-                t.tried.clear();
-                queue.addLast(t);
-
-                logQueue("все мастера заняты, заявка " + t.ticketId + " ждёт в очереди");
-                log.info(getLocalName() + ": все мастера заняты, заявка " + t.ticketId + " перенесена в конец очереди");
-
-                doWait(250);
-                break;
-            }
-
-            queue.removeFirst();
-
-            String conv = "assign-" + t.ticketId + "-" + System.nanoTime();
-            inFlightByConv.put(conv, t);
-
-            busyByTech.put(tech.getName(), true);
-
-            ACLMessage req = new ACLMessage(ACLMessage.REQUEST);
-            req.addReceiver(tech);
-            req.setLanguage(ServiceOntology.LANG);
-            req.setProtocol(ServiceOntology.PROTOCOL_ASSIGN);
-            req.setConversationId(conv);
-            req.setContent(
-                    "ID заявки: " + t.ticketId +
-                            "\nПроблема: " + t.issue +
-                            "\nКлиент: " + t.client.getLocalName()
-            );
-
-            logQueue("назначение " + t.ticketId + " -> " + tech.getLocalName());
-            send(req);
-
-            log.info(getLocalName() + ": заявка " + t.ticketId +
-                    " назначена мастеру " + tech.getLocalName());
+        if (t.tried.size() >= technicians.size()) {
+            t.tried.clear();
         }
+
+        AID tech = pickTechnician(t);
+        if (tech == null) {
+            queue.removeFirst();
+            queue.addLast(t);
+            logQueue("нет доступных мастеров, заявка " + t.ticketId + " ждёт");
+            return;
+        }
+
+        queue.removeFirst();
+
+        String conv = "assign-" + t.ticketId + "-" + System.nanoTime();
+        pendingByConv.put(conv, t);
+
+        ACLMessage req = new ACLMessage(ACLMessage.REQUEST);
+        req.addReceiver(tech);
+        req.setLanguage(ServiceOntology.LANG);
+        req.setProtocol(ServiceOntology.PROTOCOL_ASSIGN);
+        req.setConversationId(conv);
+        req.setContent(
+                "ID заявки: " + t.ticketId +
+                        "\nПроблема: " + t.issue +
+                        "\nКлиент: " + t.client.getLocalName() +
+                        "\nДиспетчер: " + getLocalName()
+        );
+
+        cooldownUntilByTech.put(tech.getName(), System.currentTimeMillis() + optimisticCooldownMs);
+
+        logQueue("назначение " + t.ticketId + " -> " + tech.getLocalName());
+        send(req);
     }
 
-    private AID pickFreeTechnician(Ticket t) {
+    private AID pickTechnician(Ticket t) {
+        long now = System.currentTimeMillis();
         int n = technicians.size();
+
         for (int k = 0; k < n; k++) {
             int idx = (rr + k) % n;
             AID cand = technicians.get(idx);
+            String key = cand.getName();
 
-            String name = cand.getName();
-            boolean busy = busyByTech.getOrDefault(name, false);
+            if (t.tried.contains(key)) continue;
 
-            if (!busy && !t.tried.contains(name)) {
-                rr = (idx + 1) % n;
-                return cand;
-            }
+            Long until = cooldownUntilByTech.get(key);
+            if (until != null && until > now) continue;
+
+            rr = (idx + 1) % n;
+            return cand;
         }
         return null;
     }
@@ -250,37 +250,36 @@ public class DispatcherAgent extends Agent {
 
             DFAgentDescription[] found = DFService.search(this, template);
 
-            Set<String> newSet = new HashSet<>();
             technicians.clear();
-            for (DFAgentDescription d : found) {
-                AID aid = d.getName();
-                technicians.add(aid);
-                newSet.add(aid.getName());
-            }
-
+            for (DFAgentDescription d : found) technicians.add(d.getName());
             technicians.sort(Comparator.comparing(AID::getName));
+
             if (rr >= technicians.size()) rr = 0;
 
-            busyByTech.keySet().removeIf(k -> !newSet.contains(k));
-            for (AID t : technicians) busyByTech.putIfAbsent(t.getName(), false);
+            Set<String> alive = new HashSet<>();
+            for (AID a : technicians) alive.add(a.getName());
+            cooldownUntilByTech.keySet().removeIf(k -> !alive.contains(k));
 
         } catch (FIPAException e) {
             technicians.clear();
-            busyByTech.clear();
+            cooldownUntilByTech.clear();
             rr = 0;
         }
     }
 
     private void logQueue(String reason) {
         int inQueue = queue.size();
+        int pending = pendingByConv.size();
         int inWork = inFlightByConv.size();
 
         long now = System.currentTimeMillis();
-        if (now - lastQueueLogAt < 250 && (reason == null || reason.isBlank())) return;
+        if (now - lastQueueLogAt < 250) return;
         lastQueueLogAt = now;
 
         String r = (reason == null || reason.isBlank()) ? "" : (" | " + reason);
-        log.info(getLocalName() + ": состояние очереди -> в очереди: " + inQueue + ", в работе: " + inWork + r);
+        log.info(getLocalName() + ": очередь -> в очереди: " + inQueue +
+                ", pending: " + pending +
+                ", в работе: " + inWork + r);
     }
 
     private static final class Ticket {

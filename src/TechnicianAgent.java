@@ -1,6 +1,6 @@
 import jade.core.Agent;
 import jade.core.behaviours.CyclicBehaviour;
-import jade.core.behaviours.OneShotBehaviour;
+import jade.core.behaviours.WakerBehaviour;
 import jade.domain.DFService;
 import jade.domain.FIPAAgentManagement.DFAgentDescription;
 import jade.domain.FIPAAgentManagement.ServiceDescription;
@@ -23,12 +23,10 @@ public class TechnicianAgent extends Agent {
             @Override
             public void action() {
                 ACLMessage msg = receive();
-                if (msg == null) {
-                    block();
-                    return;
-                }
+                if (msg == null) { block(); return; }
 
                 if (msg.getPerformative() != ACLMessage.REQUEST) return;
+                if (!ServiceOntology.PROTOCOL_ASSIGN.equals(msg.getProtocol())) return;
 
                 if (busy) {
                     ACLMessage refuse = msg.createReply();
@@ -38,24 +36,28 @@ public class TechnicianAgent extends Agent {
                     refuse.setContent("Мастер занят");
                     send(refuse);
 
-                    log.info(getLocalName() + ": отказ — занят");
+                    log.info(getLocalName() + ": REFUSE — занят (конфликт диспетчеров возможен)");
                     return;
                 }
 
                 busy = true;
 
-                log.info(getLocalName() + ": принял заявку, начинаю работу");
+                // подтверждаем, что взяли в работу (не обязательно, но наглядно)
+                ACLMessage agree = msg.createReply();
+                agree.setPerformative(ACLMessage.AGREE);
+                agree.setLanguage(ServiceOntology.LANG);
+                agree.setProtocol(ServiceOntology.PROTOCOL_ASSIGN);
+                agree.setContent("Принял заявку в работу");
+                send(agree);
 
-                int workMs = 1000 + rnd.nextInt(2000);
+                int workMs = 900 + rnd.nextInt(2200);
                 boolean fail = rnd.nextDouble() < 0.15;
 
-                addBehaviour(new OneShotBehaviour() {
-                    @Override
-                    public void action() {
-                        try {
-                            Thread.sleep(workMs);
-                        } catch (InterruptedException ignored) {}
+                log.info(getLocalName() + ": принял заявку, работаю " + workMs + " мс");
 
+                addBehaviour(new WakerBehaviour(myAgent, workMs) {
+                    @Override
+                    protected void onWake() {
                         ACLMessage out = msg.createReply();
                         out.setLanguage(ServiceOntology.LANG);
                         out.setProtocol(ServiceOntology.PROTOCOL_ASSIGN);
@@ -64,12 +66,12 @@ public class TechnicianAgent extends Agent {
                             out.setPerformative(ACLMessage.FAILURE);
                             out.setContent("Ошибка при диагностике устройства");
                             send(out);
-                            log.info(getLocalName() + ": ошибка выполнения заявки");
+                            log.info(getLocalName() + ": FAILURE по заявке");
                         } else {
                             out.setPerformative(ACLMessage.INFORM);
                             out.setContent("Работа завершена за " + workMs + " мс");
                             send(out);
-                            log.info(getLocalName() + ": заявка успешно выполнена");
+                            log.info(getLocalName() + ": INFORM — заявка выполнена");
                         }
 
                         busy = false;
